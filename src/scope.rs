@@ -2,6 +2,7 @@ use std::fmt::{self, Display};
 use std::str::FromStr;
 
 use crate::IdCode;
+use crate::Attribute;
 
 /// A type of scope, as used in the `$scope` command.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -13,13 +14,31 @@ pub enum ScopeType {
     Function,
     Begin,
     Fork,
+    Generate,
+    Struct,
+    Union,
+    Class,
+    Interface,
+    Package,
+    Program,
+    VhdlArchitecture,
+    VhdlProcedure,
+    VhdlFunction,
+    VhdlRecord,
+    VhdlProcess,
+    VhdlBlock,
+    VhdlForGenerate,
+    VhdlIfGenerate,
+    VhdlGenerate,
+    VhdlPackage,
+    SvArray,
 }
 
 crate::unit_error_struct!(InvalidScopeType, "invalid scope type");
 
-impl FromStr for ScopeType {
-    type Err = InvalidScopeType;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+impl ScopeType {
+    /// Parse a scope type string, optionally accepting GTKWave extension types.
+    pub fn from_str_ext(s: &str, gtkwave_extensions: bool) -> Result<Self, InvalidScopeType> {
         use ScopeType::*;
         match s {
             "module" => Ok(Module),
@@ -27,8 +46,36 @@ impl FromStr for ScopeType {
             "function" => Ok(Function),
             "begin" => Ok(Begin),
             "fork" => Ok(Fork),
+            _ if gtkwave_extensions => match s {
+                "generate" => Ok(Generate),
+                "struct" => Ok(Struct),
+                "union" => Ok(Union),
+                "class" => Ok(Class),
+                "interface" => Ok(Interface),
+                "package" => Ok(Package),
+                "program" => Ok(Program),
+                "vhdl_architecture" => Ok(VhdlArchitecture),
+                "vhdl_procedure" => Ok(VhdlProcedure),
+                "vhdl_function" => Ok(VhdlFunction),
+                "vhdl_record" => Ok(VhdlRecord),
+                "vhdl_process" => Ok(VhdlProcess),
+                "vhdl_block" => Ok(VhdlBlock),
+                "vhdl_for_generate" => Ok(VhdlForGenerate),
+                "vhdl_if_generate" => Ok(VhdlIfGenerate),
+                "vhdl_generate" => Ok(VhdlGenerate),
+                "vhdl_package" => Ok(VhdlPackage),
+                "sv_array" => Ok(SvArray),
+                _ => Err(InvalidScopeType),
+            },
             _ => Err(InvalidScopeType),
         }
+    }
+}
+
+impl FromStr for ScopeType {
+    type Err = InvalidScopeType;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ScopeType::from_str_ext(s, true)
     }
 }
 
@@ -44,6 +91,24 @@ impl Display for ScopeType {
                 Function => "function",
                 Begin => "begin",
                 Fork => "fork",
+                Generate => "generate",
+                Struct => "struct",
+                Union => "union",
+                Class => "class",
+                Interface => "interface",
+                Package => "package",
+                Program => "program",
+                VhdlArchitecture => "vhdl_architecture",
+                VhdlProcedure => "vhdl_procedure",
+                VhdlFunction => "vhdl_function",
+                VhdlRecord => "vhdl_record",
+                VhdlProcess => "vhdl_process",
+                VhdlBlock => "vhdl_block",
+                VhdlForGenerate => "vhdl_for_generate",
+                VhdlIfGenerate => "vhdl_if_generate",
+                VhdlGenerate => "vhdl_generate",
+                VhdlPackage => "vhdl_package",
+                SvArray => "sv_array",
             }
         )
     }
@@ -72,13 +137,25 @@ pub enum VarType {
     Wire,
     WOr,
     String,
+    Port,
+    SparseArray,
+    RealTime,
+    Bit,
+    Logic,
+    Int,
+    ShortInt,
+    LongInt,
+    Byte,
+    Enum,
+    ShortReal,
+    RealParameter,
 }
 
 crate::unit_error_struct!(InvalidVarType, "invalid variable type");
 
-impl FromStr for VarType {
-    type Err = InvalidVarType;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+impl VarType {
+    /// Parse a var type string, optionally accepting GTKWave extension types.
+    pub fn from_str_ext(s: &str, gtkwave_extensions: bool) -> Result<Self, InvalidVarType> {
         use VarType::*;
         match s {
             "event" => Ok(Event),
@@ -99,8 +176,30 @@ impl FromStr for VarType {
             "wire" => Ok(Wire),
             "wor" => Ok(WOr),
             "string" => Ok(String),
+            _ if gtkwave_extensions => match s {
+                "port" => Ok(Port),
+                "sparray" => Ok(SparseArray),
+                "realtime" => Ok(RealTime),
+                "bit" => Ok(Bit),
+                "logic" => Ok(Logic),
+                "int" => Ok(Int),
+                "shortint" => Ok(ShortInt),
+                "longint" => Ok(LongInt),
+                "byte" => Ok(Byte),
+                "enum" => Ok(Enum),
+                "shortreal" => Ok(ShortReal),
+                "real_parameter" => Ok(RealParameter),
+                _ => Err(InvalidVarType),
+            },
             _ => Err(InvalidVarType),
         }
+    }
+}
+
+impl FromStr for VarType {
+    type Err = InvalidVarType;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        VarType::from_str_ext(s, true)
     }
 }
 
@@ -129,6 +228,18 @@ impl Display for VarType {
                 Wire => "wire",
                 WOr => "wor",
                 String => "string",
+                Port => "port",
+                SparseArray => "sparray",
+                RealTime => "realtime",
+                Bit => "bit",
+                Logic => "logic",
+                Int => "int",
+                ShortInt => "shortint",
+                LongInt => "longint",
+                Byte => "byte",
+                Enum => "enum",
+                ShortReal => "shortreal",
+                RealParameter => "real_parameter",
             }
         )
     }
@@ -291,4 +402,7 @@ pub enum ScopeItem {
 
     /// `$comment` - Comment
     Comment(String),
+
+    /// `$attrbegin` - GTKWave/FST attribute
+    Attribute(Attribute),
 }

@@ -3,9 +3,10 @@ use std::{io, fmt};
 use std::str::{from_utf8, FromStr};
 
 use crate::{
-    Command, Header, InvalidIdCode, InvalidReferenceIndex, InvalidScopeType, InvalidTimescaleUnit,
-    InvalidValue, InvalidVarType, ReferenceIndex, Scope, ScopeItem, ScopeType, SimulationCommand,
-    Value, Var,
+    Attribute, AttributeType, Command, Header, InvalidAttributeType, InvalidIdCode,
+    InvalidMiscAttributeSubtype, InvalidReferenceIndex, InvalidScopeType, InvalidTimescaleUnit,
+    InvalidValue, InvalidVarType, MiscAttributeSubtype, ReferenceIndex, Scope, ScopeItem,
+    ScopeType, SimulationCommand, Value, Var,
 };
 
 fn whitespace_byte(b: u8) -> bool {
@@ -60,6 +61,8 @@ pub struct Parser<R> {
     line: u64,
     end_of_line: bool,
     simulation_command: Option<SimulationCommand>,
+    gtkwave_extensions: bool,
+    ignore_unknown_attributes: bool,
 }
 
 impl<R: io::BufRead> Parser<R> {
@@ -86,7 +89,24 @@ impl<R: io::BufRead> Parser<R> {
             line: 1,
             end_of_line: false,
             simulation_command: None,
+            gtkwave_extensions: false,
+            ignore_unknown_attributes: false,
         }
+    }
+
+    /// Enable parsing of GTKWave/FST extensions to VCD
+    /// (attribute commands, extended scope types, extended var types).
+    pub fn with_gtkwave_extensions(mut self, enable: bool) -> Self {
+        self.gtkwave_extensions = enable;
+        self
+    }
+
+    /// When GTKWave extensions are enabled, ignore unrecognized attribute types/subtypes
+    /// instead of returning an error. Unrecognized attributes will be silently skipped.
+    /// Has no effect when gtkwave_extensions is false.
+    pub fn with_ignore_unknown_attributes(mut self, ignore: bool) -> Self {
+        self.ignore_unknown_attributes = ignore;
+        self
     }
 
     /// Get the wrapped [`io::BufRead`].
@@ -209,6 +229,72 @@ impl<R: io::BufRead> Parser<R> {
         Ok(s.trim().to_string()) // TODO: don't reallocate
     }
 
+    fn skip_to_end(&mut self) -> Result<(), io::Error> {
+        let mut buf = [0; 64];
+        loop {
+            let tok = self.read_token(&mut buf)?;
+            if tok == b"$end" {
+                return Ok(());
+            }
+        }
+    }
+
+    fn parse_attribute_begin(&mut self) -> Result<Option<Command>, io::Error> {
+        let mut buf = [0; 32];
+        let type_str = self.read_token_str(&mut buf)?.to_owned();
+
+        let attr_type = match type_str.parse::<AttributeType>() {
+            Ok(t) => t,
+            Err(e) => {
+                if self.ignore_unknown_attributes {
+                    self.skip_to_end()?;
+                    return Ok(None);
+                }
+                return Err(self.error(e).into());
+            }
+        };
+
+        let subtype = self.read_token_string()?;
+
+        // For misc type, validate the hex subtype if not ignoring unknowns
+        if attr_type == AttributeType::Misc && !self.ignore_unknown_attributes {
+            MiscAttributeSubtype::from_hex(&subtype).map_err(|e| self.error(e))?;
+        }
+
+        // Read remaining tokens: collect name and arg
+        // The format is: $attrbegin <type> <subtype> [<name>] [<arg>...] $end
+        // We read all tokens until $end, treating the last numeric one as arg and
+        // everything between subtype and that as the name.
+        let mut tokens = Vec::new();
+        let mut buf = [0; 256];
+        loop {
+            let tok = self.read_token_str(&mut buf)?.to_owned();
+            if tok == "$end" {
+                break;
+            }
+            tokens.push(tok);
+        }
+
+        let (name, arg) = match tokens.len() {
+            0 => (String::new(), 0i64),
+            1 => {
+                // Could be just an arg or just a name
+                match tokens[0].parse::<i64>() {
+                    Ok(v) => (String::new(), v),
+                    Err(_) => (tokens.into_iter().next().unwrap(), 0i64),
+                }
+            }
+            _ => {
+                // Last token is the arg, everything else is the name
+                let arg = tokens.last().unwrap().parse::<i64>().unwrap_or(0);
+                let name = tokens[..tokens.len()-1].join(" ");
+                (name, arg)
+            }
+        };
+
+        Ok(Some(Command::AttributeBegin(attr_type, subtype, name, arg)))
+    }
+
     fn parse_command(&mut self) -> Result<Command, io::Error> {
         use Command::*;
         use SimulationCommand::*;
@@ -238,7 +324,10 @@ impl<R: io::BufRead> Parser<R> {
                 Ok(Timescale(quantity, unit))
             }
             b"scope" => {
-                let scope_type = self.read_token_parse()?;
+                let mut buf = [0; 32];
+                let tok = self.read_token_str(&mut buf)?;
+                let scope_type = ScopeType::from_str_ext(tok, self.gtkwave_extensions)
+                    .map_err(|e| self.error(e))?;
                 let identifier = self.read_token_string()?;
                 self.read_command_end()?;
                 Ok(ScopeDef(scope_type, identifier))
@@ -248,7 +337,10 @@ impl<R: io::BufRead> Parser<R> {
                 Ok(Upscope)
             }
             b"var" => {
-                let var_type = self.read_token_parse()?;
+                let mut vt_buf = [0; 32];
+                let vt_tok = self.read_token_str(&mut vt_buf)?;
+                let var_type = crate::VarType::from_str_ext(vt_tok, self.gtkwave_extensions)
+                    .map_err(|e| self.error(e))?;
                 let size = self.read_token_parse()?;
                 let code = self.read_token_parse()?;
                 let reference = self.read_token_string()?;
@@ -287,6 +379,24 @@ impl<R: io::BufRead> Parser<R> {
                 } else {
                     Err(self.error(ParseErrorKind::UnmatchedEnd).into())
                 }
+            }
+
+            b"attrbegin" if self.gtkwave_extensions => {
+                match self.parse_attribute_begin()? {
+                    Some(cmd) => Ok(cmd),
+                    // Attribute was skipped; delegate to next() which handles
+                    // the leading '$' of the next command.
+                    None => self.next().unwrap_or_else(|| {
+                        Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "unexpected end of VCD file after skipped attribute",
+                        ))
+                    }),
+                }
+            }
+            b"attrend" if self.gtkwave_extensions => {
+                self.read_command_end()?;
+                Ok(AttributeEnd)
             }
 
             _ => Err(self.error(ParseErrorKind::UnknownCommand).into()),
@@ -363,6 +473,10 @@ impl<R: io::BufRead> Parser<R> {
                 Some(Ok(Comment(comment))) => {
                     children.push(ScopeItem::Comment(comment));
                 }
+                Some(Ok(AttributeBegin(attr_type, subtype, name, arg))) => {
+                    children.push(ScopeItem::Attribute(Attribute::new(attr_type, subtype, name, arg)));
+                }
+                Some(Ok(AttributeEnd)) => {}
                 Some(Ok(_)) => return Err(self.error(ParseErrorKind::UnexpectedHeaderCommand).into()),
                 Some(Err(e)) => return Err(e),
                 None => {
@@ -417,6 +531,10 @@ impl<R: io::BufRead> Parser<R> {
                         .items
                         .push(ScopeItem::Scope(self.parse_scope(tp, id)?));
                 }
+                Some(Ok(AttributeBegin(attr_type, subtype, name, arg))) => {
+                    header.items.push(ScopeItem::Attribute(Attribute::new(attr_type, subtype, name, arg)));
+                }
+                Some(Ok(AttributeEnd)) => {}
                 Some(Ok(_)) => return Err(self.error(ParseErrorKind::UnexpectedHeaderCommand).into()),
                 Some(Err(e)) => return Err(e),
                 None => {
@@ -493,6 +611,8 @@ pub enum ParseErrorKind {
     InvalidReferenceIndex(InvalidReferenceIndex),
     InvalidValueChar(InvalidValue),
     InvalidIdCode(InvalidIdCode),
+    InvalidAttributeType(InvalidAttributeType),
+    InvalidMiscAttributeSubtype(InvalidMiscAttributeSubtype),
 }
 
 impl std::error::Error for ParseError {}
@@ -521,6 +641,8 @@ impl fmt::Display for ParseErrorKind {
             ParseErrorKind::InvalidReferenceIndex(e) => write!(f, "{}", e),
             ParseErrorKind::InvalidValueChar(e) => write!(f, "{}", e),
             ParseErrorKind::InvalidIdCode(e) => write!(f, "{}", e),
+            ParseErrorKind::InvalidAttributeType(e) => write!(f, "{}", e),
+            ParseErrorKind::InvalidMiscAttributeSubtype(e) => write!(f, "{}", e),
         }
     }
 }
@@ -555,6 +677,14 @@ impl From<InvalidIdCode> for ParseErrorKind {
 
 impl From<InvalidValue> for ParseErrorKind {
     fn from(e: InvalidValue) -> Self { ParseErrorKind::InvalidValueChar(e) }
+}
+
+impl From<InvalidAttributeType> for ParseErrorKind {
+    fn from(e: InvalidAttributeType) -> Self { ParseErrorKind::InvalidAttributeType(e) }
+}
+
+impl From<InvalidMiscAttributeSubtype> for ParseErrorKind {
+    fn from(e: InvalidMiscAttributeSubtype) -> Self { ParseErrorKind::InvalidMiscAttributeSubtype(e) }
 }
 
 impl From<ParseError> for io::Error {
@@ -1071,5 +1201,531 @@ b1 n0
         let err: Box<ParseError> = err.into_inner().unwrap().downcast().unwrap();
         assert!(matches!(err.kind, ParseErrorKind::UnexpectedCharacter), "{:?}", err);
         assert_eq!(err.line(), 7);
+    }
+
+    #[test]
+    fn gtkwave_extended_scope_types() {
+        let sample = b"
+$scope generate gen0 $end
+$scope struct s0 $end
+$var wire 1 ! x $end
+$upscope $end
+$scope vhdl_architecture arch $end
+$var wire 1 \" y $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+";
+        let mut parser = Parser::new(&sample[..])
+            .with_gtkwave_extensions(true);
+        let header = parser.parse_header().unwrap();
+
+        let scope = match &header.items[0] {
+            ScopeItem::Scope(sc) => sc,
+            x => panic!("Expected Scope, found {:?}", x),
+        };
+        assert_eq!(scope.scope_type, ScopeType::Generate);
+        assert_eq!(scope.identifier, "gen0");
+
+        let inner = match &scope.items[0] {
+            ScopeItem::Scope(sc) => sc,
+            x => panic!("Expected Scope, found {:?}", x),
+        };
+        assert_eq!(inner.scope_type, ScopeType::Struct);
+        assert_eq!(inner.identifier, "s0");
+
+        let vhdl = match &scope.items[1] {
+            ScopeItem::Scope(sc) => sc,
+            x => panic!("Expected Scope, found {:?}", x),
+        };
+        assert_eq!(vhdl.scope_type, ScopeType::VhdlArchitecture);
+    }
+
+    #[test]
+    fn gtkwave_extended_var_types() {
+        let sample = b"
+$scope module top $end
+$var port 8 ! data $end
+$var bit 1 \" flag $end
+$var logic 4 # addr $end
+$var int 32 $ count $end
+$var shortint 16 % sval $end
+$var longint 64 & lval $end
+$var byte 8 ' bval $end
+$var enum 3 ( state $end
+$var shortreal 32 ) fval $end
+$var realtime 64 * rt $end
+$var sparray 1 + sp $end
+$var real_parameter 64 , rp $end
+$upscope $end
+$enddefinitions $end
+";
+        let mut parser = Parser::new(&sample[..])
+            .with_gtkwave_extensions(true);
+        let header = parser.parse_header().unwrap();
+
+        let scope = match &header.items[0] {
+            ScopeItem::Scope(sc) => sc,
+            x => panic!("Expected Scope, found {:?}", x),
+        };
+
+        let types = [
+            VarType::Port, VarType::Bit, VarType::Logic, VarType::Int,
+            VarType::ShortInt, VarType::LongInt, VarType::Byte,
+            VarType::Enum, VarType::ShortReal, VarType::RealTime,
+            VarType::SparseArray, VarType::RealParameter,
+        ];
+        for (i, expected_type) in types.iter().enumerate() {
+            if let ScopeItem::Var(ref v) = scope.items[i] {
+                assert_eq!(v.var_type, *expected_type, "var {} mismatch", i);
+            } else {
+                panic!("Expected Var at index {}, found {:?}", i, scope.items[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn gtkwave_extensions_rejected_when_disabled() {
+        let sample = b"
+$scope generate gen0 $end
+$var wire 1 ! x $end
+$upscope $end
+$enddefinitions $end
+";
+        let err = Parser::new(&sample[..]).parse_header().unwrap_err();
+        let err: Box<ParseError> = err.into_inner().unwrap().downcast().unwrap();
+        assert!(matches!(err.kind, ParseErrorKind::InvalidScopeType(..)));
+    }
+
+    #[test]
+    fn gtkwave_attrbegin_rejected_when_disabled() {
+        let sample = b"
+$attrbegin misc 01 envname 42 $end
+$enddefinitions $end
+";
+        let err = Parser::new(&sample[..]).parse_header().unwrap_err();
+        let err: Box<ParseError> = err.into_inner().unwrap().downcast().unwrap();
+        assert!(matches!(err.kind, ParseErrorKind::UnknownCommand));
+    }
+
+    #[test]
+    fn gtkwave_attribute_misc() {
+        use crate::AttributeType;
+
+        let sample = b"
+$scope module top $end
+$attrbegin misc 01 MY_ENV_VAR 42 $end
+$attrbegin misc 02 vhdl_type_name 7 $end
+$var wire 1 ! x $end
+$upscope $end
+$enddefinitions $end
+";
+        let mut parser = Parser::new(&sample[..])
+            .with_gtkwave_extensions(true);
+        let header = parser.parse_header().unwrap();
+
+        let scope = match &header.items[0] {
+            ScopeItem::Scope(sc) => sc,
+            x => panic!("Expected Scope, found {:?}", x),
+        };
+
+        assert_eq!(scope.items.len(), 3);
+
+        match &scope.items[0] {
+            ScopeItem::Attribute(a) => {
+                assert_eq!(a.attr_type, AttributeType::Misc);
+                assert_eq!(a.subtype, "01");
+                assert_eq!(a.name, "MY_ENV_VAR");
+                assert_eq!(a.arg, 42);
+            }
+            x => panic!("Expected Attribute, found {:?}", x),
+        }
+
+        match &scope.items[1] {
+            ScopeItem::Attribute(a) => {
+                assert_eq!(a.attr_type, AttributeType::Misc);
+                assert_eq!(a.subtype, "02");
+                assert_eq!(a.name, "vhdl_type_name");
+                assert_eq!(a.arg, 7);
+            }
+            x => panic!("Expected Attribute, found {:?}", x),
+        }
+    }
+
+    #[test]
+    fn gtkwave_attribute_array_enum_pack() {
+        use crate::AttributeType;
+
+        let sample = b"
+$scope module top $end
+$attrbegin array unpacked arr_name 0 $end
+$attrbegin enum integer enum_name 1 $end
+$attrbegin class packed cls_name 2 $end
+$attrbegin pack none pk_name 3 $end
+$var wire 1 ! x $end
+$upscope $end
+$enddefinitions $end
+";
+        let mut parser = Parser::new(&sample[..])
+            .with_gtkwave_extensions(true);
+        let header = parser.parse_header().unwrap();
+
+        let scope = match &header.items[0] {
+            ScopeItem::Scope(sc) => sc,
+            x => panic!("Expected Scope, found {:?}", x),
+        };
+
+        // array
+        match &scope.items[0] {
+            ScopeItem::Attribute(a) => {
+                assert_eq!(a.attr_type, AttributeType::Array);
+                assert_eq!(a.subtype, "unpacked");
+                assert_eq!(a.name, "arr_name");
+                assert_eq!(a.arg, 0);
+            }
+            x => panic!("Expected Attribute, found {:?}", x),
+        }
+
+        // enum
+        match &scope.items[1] {
+            ScopeItem::Attribute(a) => {
+                assert_eq!(a.attr_type, AttributeType::Enum);
+                assert_eq!(a.subtype, "integer");
+                assert_eq!(a.name, "enum_name");
+                assert_eq!(a.arg, 1);
+            }
+            x => panic!("Expected Attribute, found {:?}", x),
+        }
+
+        // class (Pack)
+        match &scope.items[2] {
+            ScopeItem::Attribute(a) => {
+                assert_eq!(a.attr_type, AttributeType::Pack);
+                assert_eq!(a.subtype, "packed");
+                assert_eq!(a.name, "cls_name");
+                assert_eq!(a.arg, 2);
+            }
+            x => panic!("Expected Attribute, found {:?}", x),
+        }
+
+        // pack (also Pack)
+        match &scope.items[3] {
+            ScopeItem::Attribute(a) => {
+                assert_eq!(a.attr_type, AttributeType::Pack);
+                assert_eq!(a.subtype, "none");
+                assert_eq!(a.name, "pk_name");
+                assert_eq!(a.arg, 3);
+            }
+            x => panic!("Expected Attribute, found {:?}", x),
+        }
+    }
+
+    #[test]
+    fn gtkwave_unknown_attribute_ignored() {
+        let sample = b"
+$scope module top $end
+$attrbegin unknown_type foo bar 0 $end
+$var wire 1 ! x $end
+$upscope $end
+$enddefinitions $end
+";
+        let mut parser = Parser::new(&sample[..])
+            .with_gtkwave_extensions(true)
+            .with_ignore_unknown_attributes(true);
+        let header = parser.parse_header().unwrap();
+
+        let scope = match &header.items[0] {
+            ScopeItem::Scope(sc) => sc,
+            x => panic!("Expected Scope, found {:?}", x),
+        };
+
+        // The unknown attribute should have been skipped
+        assert_eq!(scope.items.len(), 1);
+        assert!(matches!(&scope.items[0], ScopeItem::Var(..)));
+    }
+
+    #[test]
+    fn gtkwave_unknown_attribute_errors() {
+        let sample = b"
+$scope module top $end
+$attrbegin unknown_type foo bar 0 $end
+$var wire 1 ! x $end
+$upscope $end
+$enddefinitions $end
+";
+        let err = Parser::new(&sample[..])
+            .with_gtkwave_extensions(true)
+            .with_ignore_unknown_attributes(false)
+            .parse_header()
+            .unwrap_err();
+        let err: Box<ParseError> = err.into_inner().unwrap().downcast().unwrap();
+        assert!(matches!(err.kind, ParseErrorKind::InvalidAttributeType(..)));
+    }
+
+    #[test]
+    fn gtkwave_unknown_misc_subtype_ignored() {
+        let sample = b"
+$scope module top $end
+$attrbegin misc ff some_name 0 $end
+$var wire 1 ! x $end
+$upscope $end
+$enddefinitions $end
+";
+        let mut parser = Parser::new(&sample[..])
+            .with_gtkwave_extensions(true)
+            .with_ignore_unknown_attributes(true);
+        let header = parser.parse_header().unwrap();
+
+        let scope = match &header.items[0] {
+            ScopeItem::Scope(sc) => sc,
+            x => panic!("Expected Scope, found {:?}", x),
+        };
+
+        // Unknown misc subtype "ff" with ignore_unknown_attributes should still parse
+        // (it's stored as-is since only the type-level is validated before skip)
+        // Actually, misc subtype validation happens after attr_type is resolved,
+        // so with ignore_unknown_attributes=true, we accept it.
+        // The attribute is stored with the raw subtype string.
+        assert_eq!(scope.items.len(), 2);
+    }
+
+    #[test]
+    fn gtkwave_unknown_misc_subtype_errors() {
+        let sample = b"
+$scope module top $end
+$attrbegin misc ff some_name 0 $end
+$var wire 1 ! x $end
+$upscope $end
+$enddefinitions $end
+";
+        let err = Parser::new(&sample[..])
+            .with_gtkwave_extensions(true)
+            .with_ignore_unknown_attributes(false)
+            .parse_header()
+            .unwrap_err();
+        let err: Box<ParseError> = err.into_inner().unwrap().downcast().unwrap();
+        assert!(matches!(err.kind, ParseErrorKind::InvalidMiscAttributeSubtype(..)));
+    }
+
+    #[test]
+    fn gtkwave_attrend() {
+        let sample = b"
+$scope module top $end
+$attrbegin misc 01 env 0 $end
+$attrend $end
+$var wire 1 ! x $end
+$upscope $end
+$enddefinitions $end
+";
+        let mut parser = Parser::new(&sample[..])
+            .with_gtkwave_extensions(true);
+        let header = parser.parse_header().unwrap();
+
+        let scope = match &header.items[0] {
+            ScopeItem::Scope(sc) => sc,
+            x => panic!("Expected Scope, found {:?}", x),
+        };
+
+        // attrend is consumed but not stored
+        assert_eq!(scope.items.len(), 2);
+        assert!(matches!(&scope.items[0], ScopeItem::Attribute(..)));
+        assert!(matches!(&scope.items[1], ScopeItem::Var(..)));
+    }
+
+    #[test]
+    fn gtkwave_attribute_top_level() {
+        use crate::AttributeType;
+
+        let sample = b"
+$attrbegin misc 03 /path/to/file 1 $end
+$scope module top $end
+$var wire 1 ! x $end
+$upscope $end
+$enddefinitions $end
+";
+        let mut parser = Parser::new(&sample[..])
+            .with_gtkwave_extensions(true);
+        let header = parser.parse_header().unwrap();
+
+        assert_eq!(header.items.len(), 2);
+        match &header.items[0] {
+            ScopeItem::Attribute(a) => {
+                assert_eq!(a.attr_type, AttributeType::Misc);
+                assert_eq!(a.subtype, "03");
+                assert_eq!(a.name, "/path/to/file");
+                assert_eq!(a.arg, 1);
+            }
+            x => panic!("Expected Attribute, found {:?}", x),
+        }
+    }
+
+    #[test]
+    fn gtkwave_roundtrip() {
+        use crate::AttributeType;
+
+        let sample = b"
+$scope generate gen0 $end
+$attrbegin misc 01 MY_ENV 42 $end
+$attrbegin array unpacked arr 0 $end
+$var bit 1 ! flag $end
+$scope vhdl_record rec $end
+$var logic 4 \" addr $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+";
+        // Parse
+        let mut parser = Parser::new(&sample[..])
+            .with_gtkwave_extensions(true);
+        let header = parser.parse_header().unwrap();
+
+        // Write
+        let mut buf = Vec::new();
+        {
+            let mut writer = crate::Writer::new(&mut buf);
+            writer.header(&header).unwrap();
+        }
+
+        // Re-parse
+        let mut parser2 = Parser::new(&buf[..])
+            .with_gtkwave_extensions(true);
+        let header2 = parser2.parse_header().unwrap();
+
+        // Compare
+        let scope = match &header2.items[0] {
+            ScopeItem::Scope(sc) => sc,
+            x => panic!("Expected Scope, found {:?}", x),
+        };
+        assert_eq!(scope.scope_type, ScopeType::Generate);
+        assert_eq!(scope.identifier, "gen0");
+
+        match &scope.items[0] {
+            ScopeItem::Attribute(a) => {
+                assert_eq!(a.attr_type, AttributeType::Misc);
+                assert_eq!(a.subtype, "01");
+                assert_eq!(a.name, "MY_ENV");
+                assert_eq!(a.arg, 42);
+            }
+            x => panic!("Expected Attribute, found {:?}", x),
+        }
+
+        match &scope.items[1] {
+            ScopeItem::Attribute(a) => {
+                assert_eq!(a.attr_type, AttributeType::Array);
+                assert_eq!(a.subtype, "unpacked");
+                assert_eq!(a.name, "arr");
+                assert_eq!(a.arg, 0);
+            }
+            x => panic!("Expected Attribute, found {:?}", x),
+        }
+
+        if let ScopeItem::Var(ref v) = scope.items[2] {
+            assert_eq!(v.var_type, VarType::Bit);
+            assert_eq!(v.reference, "flag");
+        } else {
+            panic!("Expected Var");
+        }
+
+        let inner = match &scope.items[3] {
+            ScopeItem::Scope(sc) => sc,
+            x => panic!("Expected Scope, found {:?}", x),
+        };
+        assert_eq!(inner.scope_type, ScopeType::VhdlRecord);
+
+        if let ScopeItem::Var(ref v) = inner.items[0] {
+            assert_eq!(v.var_type, VarType::Logic);
+            assert_eq!(v.reference, "addr");
+        } else {
+            panic!("Expected Var");
+        }
+    }
+
+    #[test]
+    fn gtkwave_all_scope_types_roundtrip() {
+        let scope_types = [
+            "generate", "struct", "union", "class", "interface", "package",
+            "program", "vhdl_architecture", "vhdl_procedure", "vhdl_function",
+            "vhdl_record", "vhdl_process", "vhdl_block", "vhdl_for_generate",
+            "vhdl_if_generate", "vhdl_generate", "vhdl_package", "sv_array",
+        ];
+
+        for st in &scope_types {
+            let input = format!(
+                "$scope {} test $end\n$var wire 1 ! x $end\n$upscope $end\n$enddefinitions $end\n",
+                st
+            );
+            let mut parser = Parser::new(input.as_bytes())
+                .with_gtkwave_extensions(true);
+            let header = parser.parse_header().unwrap();
+
+            let scope = match &header.items[0] {
+                ScopeItem::Scope(sc) => sc,
+                x => panic!("Expected Scope for {}, found {:?}", st, x),
+            };
+
+            // Verify Display round-trips
+            assert_eq!(format!("{}", scope.scope_type), *st);
+        }
+    }
+
+    #[test]
+    fn gtkwave_all_var_types_roundtrip() {
+        let var_types = [
+            "port", "sparray", "realtime", "bit", "logic", "int",
+            "shortint", "longint", "byte", "enum", "shortreal", "real_parameter",
+        ];
+
+        for vt in &var_types {
+            let input = format!(
+                "$scope module top $end\n$var {} 1 ! x $end\n$upscope $end\n$enddefinitions $end\n",
+                vt
+            );
+            let mut parser = Parser::new(input.as_bytes())
+                .with_gtkwave_extensions(true);
+            let header = parser.parse_header().unwrap();
+
+            let scope = match &header.items[0] {
+                ScopeItem::Scope(sc) => sc,
+                x => panic!("Expected Scope for var type {}, found {:?}", vt, x),
+            };
+
+            if let ScopeItem::Var(ref v) = scope.items[0] {
+                assert_eq!(format!("{}", v.var_type), *vt);
+            } else {
+                panic!("Expected Var for var type {}", vt);
+            }
+        }
+    }
+
+    #[test]
+    fn gtkwave_enum_table_attribute() {
+        use crate::AttributeType;
+
+        let sample = b"
+$scope module top $end
+$attrbegin misc 07 my_enum 3 val0 val1 val2 0 1 2 42 $end
+$var enum 2 ! state $end
+$upscope $end
+$enddefinitions $end
+";
+        let mut parser = Parser::new(&sample[..])
+            .with_gtkwave_extensions(true);
+        let header = parser.parse_header().unwrap();
+
+        let scope = match &header.items[0] {
+            ScopeItem::Scope(sc) => sc,
+            x => panic!("Expected Scope, found {:?}", x),
+        };
+
+        match &scope.items[0] {
+            ScopeItem::Attribute(a) => {
+                assert_eq!(a.attr_type, AttributeType::Misc);
+                assert_eq!(a.subtype, "07");
+                // name collects all tokens except the last (which is arg)
+                assert_eq!(a.name, "my_enum 3 val0 val1 val2 0 1 2");
+                assert_eq!(a.arg, 42);
+            }
+            x => panic!("Expected Attribute, found {:?}", x),
+        }
     }
 }

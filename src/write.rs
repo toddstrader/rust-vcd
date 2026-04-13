@@ -1,8 +1,8 @@
 use std::io;
 
 use crate::{
-    Command, Header, IdCode, ReferenceIndex, Scope, ScopeItem, ScopeType, SimulationCommand,
-    TimescaleUnit, Value, Var, VarType,
+    Attribute, AttributeType, Command, Header, IdCode, ReferenceIndex, Scope, ScopeItem,
+    ScopeType, SimulationCommand, TimescaleUnit, Value, Var, VarType,
 };
 
 /// Struct wrapping an [`std::io::Write`] with methods for writing VCD commands and data.
@@ -81,6 +81,7 @@ impl<W: io::Write> Writer<W> {
                 ScopeItem::Var(ref v) => self.var(v)?,
                 ScopeItem::Scope(ref s) => self.scope(s)?,
                 ScopeItem::Comment(ref c) => self.comment(c)?,
+                ScopeItem::Attribute(ref a) => self.attribute(a)?,
             }
         }
         self.enddefinitions()
@@ -138,6 +139,7 @@ impl<W: io::Write> Writer<W> {
                 ScopeItem::Var(ref v) => self.var(v)?,
                 ScopeItem::Scope(ref s) => self.scope(s)?,
                 ScopeItem::Comment(ref c) => self.comment(c)?,
+                ScopeItem::Attribute(ref a) => self.attribute(a)?,
             }
         }
         self.upscope()
@@ -249,6 +251,31 @@ impl<W: io::Write> Writer<W> {
         writeln!(self.writer, "$end")
     }
 
+    /// Writes a `$attrbegin` command (GTKWave/FST extension).
+    pub fn attribute_begin(
+        &mut self,
+        attr_type: AttributeType,
+        subtype: &str,
+        name: &str,
+        arg: i64,
+    ) -> io::Result<()> {
+        if name.is_empty() {
+            writeln!(self.writer, "$attrbegin {} {} {} $end", attr_type, subtype, arg)
+        } else {
+            writeln!(self.writer, "$attrbegin {} {} {} {} $end", attr_type, subtype, name, arg)
+        }
+    }
+
+    /// Writes a `$attrend` command (GTKWave/FST extension).
+    pub fn attribute_end(&mut self) -> io::Result<()> {
+        writeln!(self.writer, "$attrend $end")
+    }
+
+    /// Writes an [`Attribute`] from the parser.
+    pub fn attribute(&mut self, a: &Attribute) -> io::Result<()> {
+        self.attribute_begin(a.attr_type, &a.subtype, &a.name, a.arg)
+    }
+
     /// Writes a command from a [`Command`] enum as parsed by the parser.
     pub fn command(&mut self, c: &Command) -> io::Result<()> {
         use Command::*;
@@ -268,6 +295,8 @@ impl<W: io::Write> Writer<W> {
             ChangeString(i, ref v) => self.change_string(i, v),
             Begin(c) => self.begin(c),
             End(_) => self.end(),
+            AttributeBegin(t, ref s, ref n, a) => self.attribute_begin(t, s, n, a),
+            AttributeEnd => self.attribute_end(),
         }
     }
 }

@@ -113,6 +113,21 @@ pub use value::{ Value, Vector, VectorIter, InvalidValue };
 mod timescale;
 pub use timescale::{ TimescaleUnit, InvalidTimescaleUnit };
 
+mod attribute;
+pub use attribute::{
+    Attribute,
+    AttributeType,
+    InvalidAttributeType,
+    MiscAttributeSubtype,
+    InvalidMiscAttributeSubtype,
+    ArrayType,
+    InvalidArrayType,
+    EnumValueType,
+    InvalidEnumValueType,
+    PackType,
+    InvalidPackType,
+};
+
 mod scope;
 pub use scope::{
     Scope,
@@ -194,6 +209,13 @@ pub enum Command {
 
     /// An end of a simulation command.
     End(SimulationCommand),
+
+    /// A `$attrbegin` command (GTKWave/FST extension).
+    /// Contains the attribute type, subtype string, name, and numeric argument.
+    AttributeBegin(AttributeType, String, String, i64),
+
+    /// A `$attrend` command (GTKWave/FST extension).
+    AttributeEnd,
 }
 
 /// A simulation command type, used in `Command::Begin` and `Command::End`.

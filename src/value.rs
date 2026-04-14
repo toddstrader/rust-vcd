@@ -89,7 +89,7 @@ impl Vector {
     }
 
     /// Returns an iterator over the values in the vector.
-    pub fn iter(&self) -> VectorIter {
+    pub fn iter(&self) -> VectorIter<'_> {
         VectorIter(self.0.iter())
     }
 
@@ -100,7 +100,7 @@ impl Vector {
 
     /// Returns a `Vector` of the specified `width` filled with the value `v`
     pub fn filled(v: Value, width: usize) -> Vector {
-        Vector(std::iter::repeat(v).take(width).collect())
+        Vector(std::iter::repeat_n(v, width).collect())
     }
 
     /// Returns a vector of `width` zeros
